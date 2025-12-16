@@ -2,6 +2,8 @@ import io
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Tuple
+from PIL import Image
+
 
 import streamlit as st
 from PIL import Image
@@ -11,9 +13,13 @@ from PIL import UnidentifiedImageError
 
 
 
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".img"}
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".img", ".heic", ".helf"}
 
-
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
 # -----------------------------
 # Zip filename decoding helpers
 # -----------------------------
