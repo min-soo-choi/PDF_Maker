@@ -100,25 +100,44 @@ def list_zip_items(
     return fixed_names, fixed_to_raw
 
 
+def list_direct_items(
+    uploaded_files: List,
+    allow_pdfs: bool,
+) -> Tuple[List[str], Dict[str, object]]:
+    """
+    개별 업로드 파일 리스트를 반환.
+    - return: (표시명 목록, 표시명 -> UploadedFile 매핑)
+    """
+    allowed = set(IMG_EXTS)
+    if allow_pdfs:
+        allowed.add(".pdf")
+
+    fixed_to_file: Dict[str, object] = {}
+    fixed_names: List[str] = []
+
+    for f in uploaded_files:
+        suf = Path(f.name).suffix.lower()
+        if suf not in allowed:
+            continue
+
+        fixed = f.name
+        if fixed in fixed_to_file:
+            stem = Path(fixed).stem
+            suf = Path(fixed).suffix
+            k = 2
+            while f"{stem} ({k}){suf}" in fixed_to_file:
+                k += 1
+            fixed = f"{stem} ({k}){suf}"
+
+        fixed_to_file[fixed] = f
+        fixed_names.append(fixed)
+
+    return fixed_names, fixed_to_file
+
+
 # -----------------------------
 # PDF merging helpers
 # -----------------------------
-def image_bytes_to_pdf_page(img_bytes: bytes):
-    """
-    이미지 bytes -> 1페이지 PDF page로 변환
-    """
-    im = Image.open(io.BytesIO(img_bytes))
-    if im.mode in ("RGBA", "P"):
-        im = im.convert("RGB")
-    else:
-        im = im.convert("RGB")
-
-    buf = io.BytesIO()
-    im.save(buf, format="PDF")
-    buf.seek(0)
-
-    reader = PdfReader(buf)
-    return reader.pages[0]
 
 
 def merge_zip_in_order(
@@ -145,6 +164,34 @@ def merge_zip_in_order(
             elif suf in IMG_EXTS:
                 page = image_bytes_to_pdf_page(data)
                 writer.add_page(page)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def merge_direct_files_in_order(
+    ordered_fixed_names: List[str],
+    fixed_to_file: Dict[str, object],
+) -> bytes:
+    """
+    ordered_fixed_names 순서대로 업로드된 파일을 읽어 하나의 PDF로 병합.
+    """
+    writer = PdfWriter()
+
+    for fixed in ordered_fixed_names:
+        uploaded_file = fixed_to_file[fixed]
+        suf = Path(fixed).suffix.lower()
+
+        data = uploaded_file.getvalue()
+
+        if suf == ".pdf":
+            reader = PdfReader(io.BytesIO(data))
+            for page in reader.pages:
+                writer.add_page(page)
+        elif suf in IMG_EXTS:
+            page = image_bytes_to_pdf_page(data)
+            writer.add_page(page)
 
     out = io.BytesIO()
     writer.write(out)
@@ -186,7 +233,9 @@ def normalize_pdf_name(name: str) -> str:
 st.set_page_config(page_title="Zip → Drag Sort → PDF (Stable)", layout="wide")
 st.title("Zip 업로드 → 드래그 정렬 → PDF 병합 (최종 안정 버전)")
 
-tab0, tab1, tab2 = st.tabs(["설명", "1) 이미지 zip → PDF", "2) PDF+이미지 zip → PDF"])
+tab0, tab1, tab2, tab3 = st.tabs(
+    ["설명", "1) 이미지 zip → PDF", "2) PDF+이미지 zip → PDF", "3) PDF/이미지 직접 업로드"]
+)
 
 with tab0:
     st.header("앱 설명 / 사용 방법")
@@ -281,6 +330,7 @@ with tab1:
                 except Exception as e:
                     st.error("알 수 없는 오류가 발생했습니다.")
                     st.exception(e)  # 개발 중에만 사용 (스택트레이스 표시)
+
 with tab2:
     uploaded = st.file_uploader("PDF와 이미지가 섞인 zip 업로드", type=["zip"], key="zip_mixed")
 
@@ -317,3 +367,47 @@ with tab2:
                     st.error("알 수 없는 오류가 발생했습니다.")
                     st.exception(e)  # 개발 중에만 사용 (스택트레이스 표시)
 
+with tab3:
+    st.subheader("zip 없이 PDF/이미지 직접 업로드")
+    st.caption("여러 개의 PDF/이미지 파일을 선택해서 바로 정렬하고 병합할 수 있습니다.")
+
+    direct_types = [ext.lstrip(".") for ext in sorted(list(IMG_EXTS | {".pdf"}))]
+    uploaded_files = st.file_uploader(
+        "PDF/이미지 파일 업로드 (여러 개 선택 가능)",
+        type=direct_types,
+        accept_multiple_files=True,
+        key="direct_files",
+    )
+
+    if uploaded_files:
+        fixed_names, fixed_to_file = list_direct_items(uploaded_files, allow_pdfs=True)
+
+        if not fixed_names:
+            st.error("업로드된 파일에서 PDF/이미지를 찾지 못했어요.")
+        else:
+            st.write("파일 개수:", len(fixed_names))
+            with st.expander("파일 목록 보기", expanded=False):
+                for x in fixed_names:
+                    st.write(nice_label(x))
+
+            ordered = drag_sort_list_ui("PDF + 이미지 순서 정렬", fixed_names, key="sort_direct")
+
+            pdf_name_input = st.text_input("다운로드 PDF 파일명", value="merged.pdf", key="pdf_name_direct")
+            pdf_name = normalize_pdf_name(pdf_name_input)
+
+            if st.button("정렬된 순서로 하나의 PDF 만들기", key="make_pdf_direct"):
+                try:
+                    pdf_bytes = merge_direct_files_in_order(ordered, fixed_to_file)
+                    st.download_button(
+                        "PDF 다운로드",
+                        data=pdf_bytes,
+                        file_name=pdf_name,
+                        mime="application/pdf",
+                        key="download_direct_pdf",
+                    )
+                except ValueError as e:
+                    st.error(f"PDF 생성 중 오류가 발생했습니다.\n\n{e}")
+
+                except Exception as e:
+                    st.error("알 수 없는 오류가 발생했습니다.")
+                    st.exception(e)  # 개발 중에만 사용 (스택트레이스 표시)
