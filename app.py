@@ -1,15 +1,14 @@
+import base64
 import io
 import zipfile
 from pathlib import Path
 from typing import Dict, List, Tuple
-from PIL import Image
-
 
 import streamlit as st
-from PIL import Image
+import streamlit.components.v1 as components
+from PIL import Image, UnidentifiedImageError
 from pypdf import PdfReader, PdfWriter
 from streamlit_sortables import sort_items
-from PIL import UnidentifiedImageError
 
 
 
@@ -20,6 +19,8 @@ try:
     pillow_heif.register_heif_opener()
 except Exception:
     pass
+
+ROTATION_CHOICES = [0, 90, 180, 270]
 # -----------------------------
 # Zip filename decoding helpers
 # -----------------------------
@@ -33,7 +34,7 @@ def fix_zip_name(raw_name: str) -> str:
     except Exception:
         return raw_name
 
-def image_bytes_to_pdf_page(img_bytes: bytes):
+def image_bytes_to_pdf_page(img_bytes: bytes, rotate_deg: int = 0, high_quality: bool = False):
     try:
         im = Image.open(io.BytesIO(img_bytes))
     except UnidentifiedImageError:
@@ -44,8 +45,16 @@ def image_bytes_to_pdf_page(img_bytes: bytes):
     else:
         im = im.convert("RGB")
 
+    if rotate_deg % 360 != 0:
+        # PIL: 양수는 반시계 회전이므로 시계 방향이 되도록 음수
+        im = im.rotate(-rotate_deg, expand=True)
+
     buf = io.BytesIO()
-    im.save(buf, format="PDF")
+    save_kwargs = {"format": "PDF"}
+    if high_quality:
+        # 덜 압축된 JPEG로 포함. PNG 등의 무손실은 자동 처리.
+        save_kwargs.update({"quality": 95, "subsampling": 0})
+    im.save(buf, **save_kwargs)
     buf.seek(0)
 
     reader = PdfReader(buf)
@@ -66,6 +75,11 @@ def list_zip_items(
 
     fixed_to_raw: Dict[str, str] = {}
     fixed_names: List[str] = []
+
+    try:
+        uploaded_zip.seek(0)
+    except Exception:
+        pass
 
     with zipfile.ZipFile(uploaded_zip) as zf:
         for info in zf.infolist():
@@ -144,11 +158,21 @@ def merge_zip_in_order(
     uploaded_zip,
     ordered_fixed_names: List[str],
     fixed_to_raw: Dict[str, str],
+    rotations_images: Dict[str, int] | None = None,
+    rotations_pdf_pages: Dict[str, Dict[int, int]] | None = None,
+    high_quality_images: bool = False,
 ) -> bytes:
     """
     ordered_fixed_names 순서대로 zip에서 파일을 읽어 하나의 PDF로 병합.
     """
     writer = PdfWriter()
+    rotations_images = rotations_images or {}
+    rotations_pdf_pages = rotations_pdf_pages or {}
+
+    try:
+        uploaded_zip.seek(0)
+    except Exception:
+        pass
 
     with zipfile.ZipFile(uploaded_zip) as zf:
         for fixed in ordered_fixed_names:
@@ -159,10 +183,14 @@ def merge_zip_in_order(
 
             if suf == ".pdf":
                 reader = PdfReader(io.BytesIO(data))
-                for page in reader.pages:
+                for idx, page in enumerate(reader.pages, start=1):
+                    angle = rotations_pdf_pages.get(fixed, {}).get(idx, 0) or 0
+                    if angle % 360 != 0:
+                        page.rotate(angle)
                     writer.add_page(page)
             elif suf in IMG_EXTS:
-                page = image_bytes_to_pdf_page(data)
+                angle = rotations_images.get(fixed, 0) or 0
+                page = image_bytes_to_pdf_page(data, rotate_deg=angle, high_quality=high_quality_images)
                 writer.add_page(page)
 
     out = io.BytesIO()
@@ -173,11 +201,16 @@ def merge_zip_in_order(
 def merge_direct_files_in_order(
     ordered_fixed_names: List[str],
     fixed_to_file: Dict[str, object],
+    rotations_images: Dict[str, int] | None = None,
+    rotations_pdf_pages: Dict[str, Dict[int, int]] | None = None,
+    high_quality_images: bool = False,
 ) -> bytes:
     """
     ordered_fixed_names 순서대로 업로드된 파일을 읽어 하나의 PDF로 병합.
     """
     writer = PdfWriter()
+    rotations_images = rotations_images or {}
+    rotations_pdf_pages = rotations_pdf_pages or {}
 
     for fixed in ordered_fixed_names:
         uploaded_file = fixed_to_file[fixed]
@@ -187,10 +220,14 @@ def merge_direct_files_in_order(
 
         if suf == ".pdf":
             reader = PdfReader(io.BytesIO(data))
-            for page in reader.pages:
+            for idx, page in enumerate(reader.pages, start=1):
+                angle = rotations_pdf_pages.get(fixed, {}).get(idx, 0) or 0
+                if angle % 360 != 0:
+                    page.rotate(angle)
                 writer.add_page(page)
         elif suf in IMG_EXTS:
-            page = image_bytes_to_pdf_page(data)
+            angle = rotations_images.get(fixed, 0) or 0
+            page = image_bytes_to_pdf_page(data, rotate_deg=angle, high_quality=high_quality_images)
             writer.add_page(page)
 
     out = io.BytesIO()
@@ -217,6 +254,7 @@ def nice_label(s: str) -> str:
     """
     return s
 
+
 def normalize_pdf_name(name: str) -> str:
     name = name.strip()
     if not name:
@@ -225,6 +263,204 @@ def normalize_pdf_name(name: str) -> str:
         name += ".pdf"
     return name
 
+
+def human_size(num_bytes: int) -> str:
+    units = ["B", "KB", "MB", "GB"]
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f}{unit}"
+        size /= 1024
+
+
+def show_pdf_preview(pdf_bytes: bytes, key_prefix: str, height: int = 720) -> None:
+    """
+    Render PDF bytes inline without saving to disk.
+    """
+    b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+    # 일부 브라우저/확장프로그램이 data: PDF를 차단하므로,
+    # 브라우저 안에서 Blob URL을 생성해 안전하게 embed로 렌더링한다.
+    components.html(
+        f"""
+        <div style="border:1px solid #ddd; border-radius:6px; overflow:hidden">
+            <embed id="pdf-embed" type="application/pdf" width="100%" height="{height}" />
+            <div style="padding:8px; font-size:13px; color:#444;">
+                미리보기가 안 보이면
+                <a id="pdf-fallback" download="preview.pdf">여기</a>
+                를 눌러 새 탭에서 열어주세요.
+            </div>
+        </div>
+        <script>
+            (function() {{
+                try {{
+                    const b64 = "{b64_pdf}";
+                    const byteChars = atob(b64);
+                    const byteNumbers = new Array(byteChars.length);
+                    for (let i = 0; i < byteChars.length; i++) {{
+                        byteNumbers[i] = byteChars.charCodeAt(i);
+                    }}
+                    const byteArray = new Uint8Array(byteNumbers);
+                    const blob = new Blob([byteArray], {{ type: "application/pdf" }});
+                    const url = URL.createObjectURL(blob);
+                    document.getElementById("pdf-embed").src = url;
+                    const link = document.getElementById("pdf-fallback");
+                    link.href = url;
+                }} catch (err) {{
+                    console.error("PDF preview failed", err);
+                }}
+            }})();
+        </script>
+        """,
+        height=height + 48,
+        scrolling=True,
+    )
+
+
+def compress_pdf_lossless(pdf_bytes: bytes) -> bytes:
+    """
+    Try to reduce PDF size by compressing content streams without touching images.
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    for page in reader.pages:
+        try:
+            page.compress_content_streams()
+        except Exception:
+            # 일부 페이지가 스트림이 없을 수 있음
+            pass
+        writer.add_page(page)
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def render_rotation_controls_for_zip(
+    fixed_names: List[str],
+    fixed_to_raw: Dict[str, str],
+    uploaded_zip,
+    state_key: str,
+) -> Dict[str, int]:
+    rotations = st.session_state.setdefault(state_key, {})
+    try:
+        uploaded_zip.seek(0)
+    except Exception:
+        pass
+    with zipfile.ZipFile(uploaded_zip) as zf:
+        for fixed in fixed_names:
+            if Path(fixed).suffix.lower() not in IMG_EXTS:
+                continue
+            try:
+                data = zf.read(fixed_to_raw[fixed])
+            except KeyError:
+                continue
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.image(data, caption=fixed, use_column_width=True)
+            with col2:
+                default_rot = rotations.get(fixed, 0) or 0
+                idx = ROTATION_CHOICES.index(default_rot) if default_rot in ROTATION_CHOICES else 0
+                rotations[fixed] = st.selectbox(
+                    "회전(시계 방향)",
+                    ROTATION_CHOICES,
+                    index=idx,
+                    key=f"{state_key}_{fixed}",
+                )
+    return rotations
+
+
+def render_rotation_controls_for_direct(
+    fixed_names: List[str],
+    fixed_to_file: Dict[str, object],
+    state_key: str,
+) -> Dict[str, int]:
+    rotations = st.session_state.setdefault(state_key, {})
+    for fixed in fixed_names:
+        if Path(fixed).suffix.lower() not in IMG_EXTS:
+            continue
+        data = fixed_to_file[fixed].getvalue()
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.image(data, caption=fixed, use_column_width=True)
+        with col2:
+            default_rot = rotations.get(fixed, 0) or 0
+            idx = ROTATION_CHOICES.index(default_rot) if default_rot in ROTATION_CHOICES else 0
+            rotations[fixed] = st.selectbox(
+                "회전(시계 방향)",
+                ROTATION_CHOICES,
+                index=idx,
+                key=f"{state_key}_{fixed}",
+            )
+    return rotations
+
+
+def render_pdf_page_rotations_for_zip(
+    fixed_names: List[str],
+    fixed_to_raw: Dict[str, str],
+    uploaded_zip,
+    state_key: str,
+) -> Dict[str, Dict[int, int]]:
+    rotations = st.session_state.setdefault(state_key, {})
+    try:
+        uploaded_zip.seek(0)
+    except Exception:
+        pass
+    with zipfile.ZipFile(uploaded_zip) as zf:
+        for fixed in fixed_names:
+            if Path(fixed).suffix.lower() != ".pdf":
+                continue
+            try:
+                data = zf.read(fixed_to_raw[fixed])
+            except KeyError:
+                continue
+            reader = PdfReader(io.BytesIO(data))
+            num_pages = len(reader.pages)
+            st.write(f"{fixed} (총 {num_pages}p)")
+            cols = st.columns(4)
+            file_map = rotations.get(fixed, {})
+            for idx in range(1, num_pages + 1):
+                default_rot = file_map.get(idx, 0) or 0
+                default_idx = ROTATION_CHOICES.index(default_rot) if default_rot in ROTATION_CHOICES else 0
+                col = cols[(idx - 1) % len(cols)]
+                with col:
+                    file_map[idx] = st.selectbox(
+                        f"p.{idx}",
+                        ROTATION_CHOICES,
+                        index=default_idx,
+                        key=f"{state_key}_{fixed}_p{idx}",
+                    )
+            rotations[fixed] = file_map
+    return rotations
+
+
+def render_pdf_page_rotations_for_direct(
+    fixed_names: List[str],
+    fixed_to_file: Dict[str, object],
+    state_key: str,
+) -> Dict[str, Dict[int, int]]:
+    rotations = st.session_state.setdefault(state_key, {})
+    for fixed in fixed_names:
+        if Path(fixed).suffix.lower() != ".pdf":
+            continue
+        data = fixed_to_file[fixed].getvalue()
+        reader = PdfReader(io.BytesIO(data))
+        num_pages = len(reader.pages)
+        st.write(f"{fixed} (총 {num_pages}p)")
+        cols = st.columns(4)
+        file_map = rotations.get(fixed, {})
+        for idx in range(1, num_pages + 1):
+            default_rot = file_map.get(idx, 0) or 0
+            default_idx = ROTATION_CHOICES.index(default_rot) if default_rot in ROTATION_CHOICES else 0
+            col = cols[(idx - 1) % len(cols)]
+            with col:
+                file_map[idx] = st.selectbox(
+                    f"p.{idx}",
+                    ROTATION_CHOICES,
+                    index=default_idx,
+                    key=f"{state_key}_{fixed}_p{idx}",
+                )
+        rotations[fixed] = file_map
+    return rotations
 
 
 # -----------------------------
@@ -312,11 +548,29 @@ with tab1:
                 for x in fixed_names:
                     st.write(nice_label(x))
 
+            high_quality_images = st.checkbox(
+                "이미지를 고화질로 포함 (용량 증가)", value=False, key="hq_images_zip_only"
+            )
+
+            rotations = st.session_state.setdefault("rotations_images", {})
+            with st.expander("이미지 미리보기 / 회전 설정", expanded=False):
+                rotations = render_rotation_controls_for_zip(
+                    fixed_names, fixed_to_raw, uploaded, state_key="rotations_images"
+                )
+
             ordered = drag_sort_list_ui("이미지 순서 정렬", fixed_names, key="sort_images")
 
             if st.button("정렬된 순서로 PDF 만들기", key="make_pdf_images"):
                 try:
-                    pdf_bytes = merge_zip_in_order(uploaded, ordered, fixed_to_raw)
+                    pdf_bytes = merge_zip_in_order(
+                        uploaded,
+                        ordered,
+                        fixed_to_raw,
+                        rotations_images=rotations,
+                        rotations_pdf_pages={},
+                        high_quality_images=high_quality_images,
+                    )
+                    st.session_state["pdf_images_bytes"] = pdf_bytes
                     st.download_button(
                         "PDF 다운로드",
                         data=pdf_bytes,
@@ -324,6 +578,20 @@ with tab1:
                         mime="application/pdf",
                         key="download_images_pdf",
                     )
+                    with st.expander("병합 PDF 미리보기 (저장 전)", expanded=False):
+                        show_pdf_preview(pdf_bytes, key_prefix="images")
+                    with st.expander("PDF 용량 줄이기 (무손실 시도)", expanded=False):
+                        if st.button("용량 줄이기 실행", key="compress_images"):
+                            compressed = compress_pdf_lossless(pdf_bytes)
+                            st.write(f"원본: {human_size(len(pdf_bytes))} → 압축: {human_size(len(compressed))}")
+                            st.download_button(
+                                "압축된 PDF 다운로드",
+                                data=compressed,
+                                file_name=pdf_name,
+                                mime="application/pdf",
+                                key="download_images_pdf_compressed",
+                            )
+                            show_pdf_preview(compressed, key_prefix="images_compressed")
                 except ValueError as e:
                     st.error(f"PDF 생성 중 오류가 발생했습니다.\n\n{e}")
 
@@ -345,6 +613,21 @@ with tab2:
                 for x in fixed_names:
                     st.write(nice_label(x))
 
+            high_quality_images = st.checkbox(
+                "이미지를 고화질로 포함 (용량 증가)", value=False, key="hq_images_zip_mixed"
+            )
+
+            rotations = st.session_state.setdefault("rotations_mixed", {})
+            pdf_rotations = st.session_state.setdefault("rotations_pdf_mixed", {})
+            with st.expander("이미지 미리보기 / 회전 설정", expanded=False):
+                rotations = render_rotation_controls_for_zip(
+                    fixed_names, fixed_to_raw, uploaded, state_key="rotations_mixed"
+                )
+            with st.expander("PDF 페이지 회전 설정", expanded=False):
+                pdf_rotations = render_pdf_page_rotations_for_zip(
+                    fixed_names, fixed_to_raw, uploaded, state_key="rotations_pdf_mixed"
+                )
+
             ordered = drag_sort_list_ui("PDF + 이미지 순서 정렬", fixed_names, key="sort_mixed")
 
             pdf_name_input = st.text_input("다운로드 PDF 파일명", value="merged.pdf", key="pdf_name_mixed")
@@ -352,7 +635,15 @@ with tab2:
 
             if st.button("정렬된 순서로 하나의 PDF 만들기", key="make_pdf_mixed"):
                 try:
-                    pdf_bytes = merge_zip_in_order(uploaded, ordered, fixed_to_raw)
+                    pdf_bytes = merge_zip_in_order(
+                        uploaded,
+                        ordered,
+                        fixed_to_raw,
+                        rotations_images=rotations,
+                        rotations_pdf_pages=pdf_rotations,
+                        high_quality_images=high_quality_images,
+                    )
+                    st.session_state["pdf_mixed_bytes"] = pdf_bytes
                     st.download_button(
                         "PDF 다운로드",
                         data=pdf_bytes,
@@ -360,6 +651,20 @@ with tab2:
                         mime="application/pdf",
                         key="download_mixed_pdf",
                     )
+                    with st.expander("병합 PDF 미리보기 (저장 전)", expanded=False):
+                        show_pdf_preview(pdf_bytes, key_prefix="mixed")
+                    with st.expander("PDF 용량 줄이기 (무손실 시도)", expanded=False):
+                        if st.button("용량 줄이기 실행", key="compress_mixed"):
+                            compressed = compress_pdf_lossless(pdf_bytes)
+                            st.write(f"원본: {human_size(len(pdf_bytes))} → 압축: {human_size(len(compressed))}")
+                            st.download_button(
+                                "압축된 PDF 다운로드",
+                                data=compressed,
+                                file_name=pdf_name,
+                                mime="application/pdf",
+                                key="download_mixed_pdf_compressed",
+                            )
+                            show_pdf_preview(compressed, key_prefix="mixed_compressed")
                 except ValueError as e:
                     st.error(f"PDF 생성 중 오류가 발생했습니다.\n\n{e}")
 
@@ -390,6 +695,21 @@ with tab3:
                 for x in fixed_names:
                     st.write(nice_label(x))
 
+            high_quality_images = st.checkbox(
+                "이미지를 고화질로 포함 (용량 증가)", value=False, key="hq_images_direct"
+            )
+
+            rotations = st.session_state.setdefault("rotations_direct", {})
+            pdf_rotations = st.session_state.setdefault("rotations_pdf_direct", {})
+            with st.expander("이미지 미리보기 / 회전 설정", expanded=False):
+                rotations = render_rotation_controls_for_direct(
+                    fixed_names, fixed_to_file, state_key="rotations_direct"
+                )
+            with st.expander("PDF 페이지 회전 설정", expanded=False):
+                pdf_rotations = render_pdf_page_rotations_for_direct(
+                    fixed_names, fixed_to_file, state_key="rotations_pdf_direct"
+                )
+
             ordered = drag_sort_list_ui("PDF + 이미지 순서 정렬", fixed_names, key="sort_direct")
 
             pdf_name_input = st.text_input("다운로드 PDF 파일명", value="merged.pdf", key="pdf_name_direct")
@@ -397,7 +717,14 @@ with tab3:
 
             if st.button("정렬된 순서로 하나의 PDF 만들기", key="make_pdf_direct"):
                 try:
-                    pdf_bytes = merge_direct_files_in_order(ordered, fixed_to_file)
+                    pdf_bytes = merge_direct_files_in_order(
+                        ordered,
+                        fixed_to_file,
+                        rotations_images=rotations,
+                        rotations_pdf_pages=pdf_rotations,
+                        high_quality_images=high_quality_images,
+                    )
+                    st.session_state["pdf_direct_bytes"] = pdf_bytes
                     st.download_button(
                         "PDF 다운로드",
                         data=pdf_bytes,
@@ -405,6 +732,20 @@ with tab3:
                         mime="application/pdf",
                         key="download_direct_pdf",
                     )
+                    with st.expander("병합 PDF 미리보기 (저장 전)", expanded=False):
+                        show_pdf_preview(pdf_bytes, key_prefix="direct")
+                    with st.expander("PDF 용량 줄이기 (무손실 시도)", expanded=False):
+                        if st.button("용량 줄이기 실행", key="compress_direct"):
+                            compressed = compress_pdf_lossless(pdf_bytes)
+                            st.write(f"원본: {human_size(len(pdf_bytes))} → 압축: {human_size(len(compressed))}")
+                            st.download_button(
+                                "압축된 PDF 다운로드",
+                                data=compressed,
+                                file_name=pdf_name,
+                                mime="application/pdf",
+                                key="download_direct_pdf_compressed",
+                            )
+                            show_pdf_preview(compressed, key_prefix="direct_compressed")
                 except ValueError as e:
                     st.error(f"PDF 생성 중 오류가 발생했습니다.\n\n{e}")
 
