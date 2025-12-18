@@ -13,6 +13,10 @@ from streamlit_sortables import sort_items
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".img", ".heic", ".helf"}
+BLANK_THUMB = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/wwAAl8B9nQ4R0QAAAAASUVORK5CYII="
+)
 
 try:
     import pillow_heif
@@ -21,6 +25,13 @@ except Exception:
     pass
 
 ROTATION_CHOICES = [0, 90, 180, 270]
+THUMB_WIDTH = 200  # 미리보기 썸네일 가로 크기 (작게)
+THUMB_PREVIEW_WIDTH = 1000  # 오버레이 확대용 최대 가로 크기 (성능 우선)
+PAGE_SIZE = 20
+
+thumb_sort_component = components.declare_component(
+    "thumb_sort_component", path=str(Path(__file__).parent / "streamlit-thumb-sort" / "build")
+)
 # -----------------------------
 # Zip filename decoding helpers
 # -----------------------------
@@ -273,6 +284,99 @@ def human_size(num_bytes: int) -> str:
         size /= 1024
 
 
+def make_thumbnail_data_url(img_bytes: bytes, max_width: int = THUMB_WIDTH, quality: int = 80) -> str:
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+    except Exception:
+        return ""
+
+    im = im.convert("RGB")
+    w, h = im.size
+    if w > max_width:
+        ratio = max_width / float(w)
+        new_size = (max_width, int(h * ratio))
+        im = im.resize(new_size)
+
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=quality, optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def ensure_order(items: List[str], session_key: str) -> List[str]:
+    saved = st.session_state.get(session_key, [])
+    ordered = [x for x in saved if x in items]
+    for x in items:
+        if x not in ordered:
+            ordered.append(x)
+    st.session_state[session_key] = ordered
+    return ordered
+
+
+def build_thumb_items_from_zip(
+    ordered_names: List[str],
+    fixed_to_raw: Dict[str, str],
+    uploaded_zip,
+    thumb_width: int,
+    preview_width: int,
+    cache_key_prefix: str,
+) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    cache = st.session_state.setdefault(f"{cache_key_prefix}_thumb_cache", {})
+    try:
+        uploaded_zip.seek(0)
+    except Exception:
+        pass
+    with zipfile.ZipFile(uploaded_zip) as zf:
+        for name in ordered_names:
+            raw = fixed_to_raw.get(name)
+            if raw is None:
+                continue
+            if name in cache:
+                items.append(cache[name])
+                continue
+            data = zf.read(raw)
+            suf = Path(name).suffix.lower()
+            if suf in IMG_EXTS:
+                thumb = make_thumbnail_data_url(data, max_width=thumb_width, quality=70)
+                full = make_thumbnail_data_url(data, max_width=preview_width, quality=85)
+            else:
+                thumb = BLANK_THUMB
+                full = BLANK_THUMB
+            cache[name] = {"id": name, "label": name, "thumb": thumb, "full": full}
+            items.append(cache[name])
+    return items
+
+
+def build_thumb_items_from_direct(
+    ordered_names: List[str],
+    fixed_to_file: Dict[str, object],
+    thumb_width: int,
+    preview_width: int,
+    cache_key_prefix: str,
+) -> List[Dict[str, str]]:
+    items: List[Dict[str, str]] = []
+    cache = st.session_state.setdefault(f"{cache_key_prefix}_thumb_cache", {})
+    for name in ordered_names:
+        if name in cache:
+            items.append(cache[name])
+            continue
+        f = fixed_to_file.get(name)
+        if not f:
+            continue
+        data = f.getvalue()
+        suf = Path(name).suffix.lower()
+        if suf in IMG_EXTS:
+            thumb = make_thumbnail_data_url(data, max_width=thumb_width, quality=70)
+            full = make_thumbnail_data_url(data, max_width=preview_width, quality=85)
+        else:
+            thumb = BLANK_THUMB
+            full = BLANK_THUMB
+        cache[name] = {"id": name, "label": name, "thumb": thumb, "full": full}
+        items.append(cache[name])
+    return items
+
+
 def show_pdf_preview(pdf_bytes: bytes, key_prefix: str, height: int = 720) -> None:
     """
     Render PDF bytes inline without saving to disk.
@@ -347,7 +451,7 @@ def render_rotation_controls_for_zip(
     except Exception:
         pass
     with zipfile.ZipFile(uploaded_zip) as zf:
-        for fixed in fixed_names:
+        for idx, fixed in enumerate(fixed_names, start=1):
             if Path(fixed).suffix.lower() not in IMG_EXTS:
                 continue
             try:
@@ -356,7 +460,8 @@ def render_rotation_controls_for_zip(
                 continue
             col1, col2 = st.columns([4, 1])
             with col1:
-                st.image(data, caption=fixed, use_column_width=True)
+                st.caption(f"{idx}. {fixed}")
+                st.image(data, width=THUMB_WIDTH)
             with col2:
                 default_rot = rotations.get(fixed, 0) or 0
                 idx = ROTATION_CHOICES.index(default_rot) if default_rot in ROTATION_CHOICES else 0
@@ -375,13 +480,14 @@ def render_rotation_controls_for_direct(
     state_key: str,
 ) -> Dict[str, int]:
     rotations = st.session_state.setdefault(state_key, {})
-    for fixed in fixed_names:
+    for idx, fixed in enumerate(fixed_names, start=1):
         if Path(fixed).suffix.lower() not in IMG_EXTS:
             continue
         data = fixed_to_file[fixed].getvalue()
         col1, col2 = st.columns([4, 1])
         with col1:
-            st.image(data, caption=fixed, use_column_width=True)
+            st.caption(f"{idx}. {fixed}")
+            st.image(data, width=THUMB_WIDTH)
         with col2:
             default_rot = rotations.get(fixed, 0) or 0
             idx = ROTATION_CHOICES.index(default_rot) if default_rot in ROTATION_CHOICES else 0
@@ -495,6 +601,12 @@ with tab0:
 - 각 이미지 파일은 **PDF의 1페이지**로 변환됩니다.
 - 정렬된 순서대로 페이지가 붙어서 최종 PDF가 만들어집니다.
 
+### 현재 동작 옵션
+- **정렬 방식**: 기본 텍스트 목록(가벼움), 썸네일 모드 전환 가능.
+- **페이징**: 20개씩 나눠 정렬.
+- **회전/미리보기**: 임시 비활성화(회전 적용 안 함).
+- **고화질 옵션**: 체크 시 이미지 페이지를 덜 압축해 포함(용량 증가).
+
 ---
 
 ## 탭 2: PDF + 이미지 zip → PDF
@@ -508,11 +620,25 @@ with tab0:
 - **이미지는 1페이지 PDF로 변환**된 뒤 병합됩니다.
 - 그래서 “PDF 중간에 이미지 페이지 끼워넣기” 같은 것도 가능합니다.
 
+### 현재 동작 옵션
+- **정렬 방식**: 기본 텍스트 목록(가벼움), 썸네일 모드 전환 가능(PDF는 회색 카드).
+- **페이징**: 20개씩 나눠 정렬.
+- **회전/미리보기**: 임시 비활성화(회전 적용 안 함).
+- **고화질 옵션**: 체크 시 이미지 페이지를 덜 압축해 포함(용량 증가).
+
 ---
 
 ## 지원 파일 형식
 - 이미지: **.jpg, .jpeg, .png, .webp, .tif, .tiff**
 - 문서: **.pdf** (탭 2에서만)
+
+---
+
+## 탭 3: PDF/이미지 직접 업로드
+- **정렬 방식**: 기본 텍스트 목록(가벼움), 썸네일 모드 전환 가능(PDF는 회색 카드).
+- **페이징**: 20개씩 나눠 정렬.
+- **회전/미리보기**: 임시 비활성화(회전 적용 안 함).
+- **고화질 옵션**: 체크 시 이미지 페이지를 덜 압축해 포함(용량 증가).
 
 ---
 
@@ -552,13 +678,42 @@ with tab1:
                 "이미지를 고화질로 포함 (용량 증가)", value=False, key="hq_images_zip_only"
             )
 
-            rotations = st.session_state.setdefault("rotations_images", {})
-            with st.expander("이미지 미리보기 / 회전 설정", expanded=False):
-                rotations = render_rotation_controls_for_zip(
-                    fixed_names, fixed_to_raw, uploaded, state_key="rotations_images"
-                )
+            # rotations 블록 임시 비활성화
+            rotations = {}
 
-            ordered = drag_sort_list_ui("이미지 순서 정렬", fixed_names, key="sort_images")
+            # 순서 정렬 모드 선택
+            use_text_mode = st.checkbox("텍스트 목록으로 정렬(썸네일 끄기)", value=True, key="text_mode_images")
+
+            ordered = ensure_order(fixed_names, session_key="order_images")
+            page = st.session_state.get("page_images", 1)
+            total_pages = max(1, (len(ordered) + PAGE_SIZE - 1) // PAGE_SIZE)
+            page = st.number_input("페이지", min_value=1, max_value=total_pages, value=page, step=1, key="page_input_images")
+            st.session_state["page_images"] = page
+            start = (page - 1) * PAGE_SIZE
+            end = start + PAGE_SIZE
+            page_items = ordered[start:end]
+
+            if use_text_mode:
+                ordered_page = drag_sort_list_ui("이미지 순서 정렬(텍스트)", page_items, key=f"sort_images_page_{page}")
+                ordered = ordered[:start] + ordered_page + ordered[end:]
+                st.session_state["order_images"] = ordered
+                st.caption("텍스트 리스트에서 드래그하여 순서를 바꾸세요.")
+            else:
+                thumb_items = build_thumb_items_from_zip(
+                    page_items,
+                    fixed_to_raw,
+                    uploaded,
+                    thumb_width=THUMB_WIDTH,
+                    preview_width=THUMB_PREVIEW_WIDTH,
+                    cache_key_prefix="images",
+                )
+                new_order = thumb_sort_component(items=thumb_items, key=f"thumb_sort_images_{page}")
+                if new_order is not None and len(new_order) == len(page_items):
+                    # 페이지 내 순서를 반영
+                    page_ordered = [x for x in new_order if x in page_items]
+                    ordered = ordered[:start] + page_ordered + ordered[end:]
+                    st.session_state["order_images"] = ordered
+                st.caption(f"썸네일을 드래그해서 순서를 바꿔보세요. (페이지 {page}/{total_pages})")
 
             if st.button("정렬된 순서로 PDF 만들기", key="make_pdf_images"):
                 try:
@@ -617,18 +772,40 @@ with tab2:
                 "이미지를 고화질로 포함 (용량 증가)", value=False, key="hq_images_zip_mixed"
             )
 
-            rotations = st.session_state.setdefault("rotations_mixed", {})
-            pdf_rotations = st.session_state.setdefault("rotations_pdf_mixed", {})
-            with st.expander("이미지 미리보기 / 회전 설정", expanded=False):
-                rotations = render_rotation_controls_for_zip(
-                    fixed_names, fixed_to_raw, uploaded, state_key="rotations_mixed"
-                )
-            with st.expander("PDF 페이지 회전 설정", expanded=False):
-                pdf_rotations = render_pdf_page_rotations_for_zip(
-                    fixed_names, fixed_to_raw, uploaded, state_key="rotations_pdf_mixed"
-                )
+            rotations = {}
+            pdf_rotations = {}
 
-            ordered = drag_sort_list_ui("PDF + 이미지 순서 정렬", fixed_names, key="sort_mixed")
+            use_text_mode = st.checkbox("텍스트 목록으로 정렬(썸네일 끄기)", value=True, key="text_mode_mixed")
+
+            ordered = ensure_order(fixed_names, session_key="order_mixed")
+            page = st.session_state.get("page_mixed", 1)
+            total_pages = max(1, (len(ordered) + PAGE_SIZE - 1) // PAGE_SIZE)
+            page = st.number_input("페이지", min_value=1, max_value=total_pages, value=page, step=1, key="page_input_mixed")
+            st.session_state["page_mixed"] = page
+            start = (page - 1) * PAGE_SIZE
+            end = start + PAGE_SIZE
+            page_items = ordered[start:end]
+
+            if use_text_mode:
+                ordered_page = drag_sort_list_ui("PDF + 이미지 순서 정렬(텍스트)", page_items, key=f"sort_mixed_page_{page}")
+                ordered = ordered[:start] + ordered_page + ordered[end:]
+                st.session_state["order_mixed"] = ordered
+                st.caption("텍스트 리스트에서 드래그하여 순서를 바꾸세요.")
+            else:
+                thumb_items = build_thumb_items_from_zip(
+                    page_items,
+                    fixed_to_raw,
+                    uploaded,
+                    thumb_width=THUMB_WIDTH,
+                    preview_width=THUMB_PREVIEW_WIDTH,
+                    cache_key_prefix="mixed",
+                )
+                new_order = thumb_sort_component(items=thumb_items, key=f"thumb_sort_mixed_{page}")
+                if new_order is not None and len(new_order) == len(page_items):
+                    page_ordered = [x for x in new_order if x in page_items]
+                    ordered = ordered[:start] + page_ordered + ordered[end:]
+                    st.session_state["order_mixed"] = ordered
+                st.caption(f"썸네일(또는 카드)을 드래그해서 순서를 바꿔보세요. (페이지 {page}/{total_pages})")
 
             pdf_name_input = st.text_input("다운로드 PDF 파일명", value="merged.pdf", key="pdf_name_mixed")
             pdf_name = normalize_pdf_name(pdf_name_input)
@@ -699,18 +876,39 @@ with tab3:
                 "이미지를 고화질로 포함 (용량 증가)", value=False, key="hq_images_direct"
             )
 
-            rotations = st.session_state.setdefault("rotations_direct", {})
-            pdf_rotations = st.session_state.setdefault("rotations_pdf_direct", {})
-            with st.expander("이미지 미리보기 / 회전 설정", expanded=False):
-                rotations = render_rotation_controls_for_direct(
-                    fixed_names, fixed_to_file, state_key="rotations_direct"
-                )
-            with st.expander("PDF 페이지 회전 설정", expanded=False):
-                pdf_rotations = render_pdf_page_rotations_for_direct(
-                    fixed_names, fixed_to_file, state_key="rotations_pdf_direct"
-                )
+            rotations = {}
+            pdf_rotations = {}
 
-            ordered = drag_sort_list_ui("PDF + 이미지 순서 정렬", fixed_names, key="sort_direct")
+            use_text_mode = st.checkbox("텍스트 목록으로 정렬(썸네일 끄기)", value=True, key="text_mode_direct")
+
+            ordered = ensure_order(fixed_names, session_key="order_direct")
+            page = st.session_state.get("page_direct", 1)
+            total_pages = max(1, (len(ordered) + PAGE_SIZE - 1) // PAGE_SIZE)
+            page = st.number_input("페이지", min_value=1, max_value=total_pages, value=page, step=1, key="page_input_direct")
+            st.session_state["page_direct"] = page
+            start = (page - 1) * PAGE_SIZE
+            end = start + PAGE_SIZE
+            page_items = ordered[start:end]
+
+            if use_text_mode:
+                ordered_page = drag_sort_list_ui("PDF + 이미지 순서 정렬(텍스트)", page_items, key=f"sort_direct_page_{page}")
+                ordered = ordered[:start] + ordered_page + ordered[end:]
+                st.session_state["order_direct"] = ordered
+                st.caption("텍스트 리스트에서 드래그하여 순서를 바꾸세요.")
+            else:
+                thumb_items = build_thumb_items_from_direct(
+                    page_items,
+                    fixed_to_file,
+                    thumb_width=THUMB_WIDTH,
+                    preview_width=THUMB_PREVIEW_WIDTH,
+                    cache_key_prefix="direct",
+                )
+                new_order = thumb_sort_component(items=thumb_items, key=f"thumb_sort_direct_{page}")
+                if new_order is not None and len(new_order) == len(page_items):
+                    page_ordered = [x for x in new_order if x in page_items]
+                    ordered = ordered[:start] + page_ordered + ordered[end:]
+                    st.session_state["order_direct"] = ordered
+                st.caption(f"썸네일(또는 카드)을 드래그해서 순서를 바꿔보세요. (페이지 {page}/{total_pages})")
 
             pdf_name_input = st.text_input("다운로드 PDF 파일명", value="merged.pdf", key="pdf_name_direct")
             pdf_name = normalize_pdf_name(pdf_name_input)
