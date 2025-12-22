@@ -575,8 +575,8 @@ def render_pdf_page_rotations_for_direct(
 st.set_page_config(page_title="Zip → Drag Sort → PDF (Stable)", layout="wide")
 st.title("Zip 업로드 → 드래그 정렬 → PDF 병합 (최종 안정 버전)")
 
-tab0, tab1, tab2, tab3 = st.tabs(
-    ["설명", "1) 이미지 zip → PDF", "2) PDF+이미지 zip → PDF", "3) PDF/이미지 직접 업로드"]
+tab0, tab1, tab2, tab3, tab4 = st.tabs(
+    ["설명", "1) 이미지 zip → PDF", "2) PDF+이미지 zip → PDF", "3) PDF/이미지 직접 업로드", "4) PDF 범위 분할"]
 )
 
 with tab0:
@@ -950,3 +950,121 @@ with tab3:
                 except Exception as e:
                     st.error("알 수 없는 오류가 발생했습니다.")
                     st.exception(e)  # 개발 중에만 사용 (스택트레이스 표시)
+
+with tab4:
+    st.subheader("PDF 페이지 범위로 여러 개 PDF로 분할")
+    st.caption("예: 1-3, 5, 7-9 처럼 입력하면 각 범위가 개별 PDF로 저장됩니다.")
+
+    split_pdf = st.file_uploader("분할할 PDF 업로드", type=["pdf"], key="split_pdf")
+    range_input = st.text_input("페이지 범위", value="1-3, 4-6", key="split_ranges")
+    default_base = Path(split_pdf.name).stem if split_pdf and split_pdf.name else "split"
+    if "split_base_name" not in st.session_state:
+        st.session_state["split_base_name"] = default_base
+    elif split_pdf and st.session_state["split_base_name"] in ("", "split"):
+        st.session_state["split_base_name"] = default_base
+    base_name = st.text_input("기본 파일명(파일명 미입력 시 사용)", key="split_base_name")
+
+    def parse_page_ranges(ranges_text: str, total_pages: int) -> List[Tuple[int, int]]:
+        ranges: List[Tuple[int, int]] = []
+        chunks = [c.strip() for c in ranges_text.split(",") if c.strip()]
+        for chunk in chunks:
+            if "-" in chunk:
+                start_s, end_s = chunk.split("-", 1)
+                start = int(start_s.strip())
+                end = int(end_s.strip())
+            else:
+                start = int(chunk)
+                end = start
+            if start < 1 or end < 1 or start > total_pages or end > total_pages:
+                raise ValueError("페이지 범위가 전체 페이지 수를 벗어났습니다.")
+            if start > end:
+                raise ValueError("페이지 범위의 시작은 끝보다 클 수 없습니다.")
+            ranges.append((start, end))
+        if not ranges:
+            raise ValueError("페이지 범위를 입력해주세요.")
+        return ranges
+
+    if split_pdf:
+        pdf_bytes = split_pdf.getvalue()
+        reader = None
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+        except Exception:
+            try:
+                # 일부 PDF는 EOF 마커가 깨져 있어서 strict=False로 우회 필요
+                reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+            except Exception as e:
+                try:
+                    # EOF 마커가 없는 경우를 대비해 강제로 추가한 뒤 재시도
+                    repaired = pdf_bytes + b"\n%%EOF\n"
+                    reader = PdfReader(io.BytesIO(repaired), strict=False)
+                except Exception as e2:
+                    st.error("PDF를 읽는 중 오류가 발생했습니다. 파일이 손상되었을 수 있어요.")
+                    st.exception(e2)
+
+        if reader:
+            total_pages = len(reader.pages)
+            st.write(f"총 페이지 수: {total_pages}")
+            ranges = None
+            custom_names: List[str] = []
+            try:
+                ranges = parse_page_ranges(range_input, total_pages)
+                st.subheader("범위별 파일명 지정")
+                for idx, (start, end) in enumerate(ranges, start=1):
+                    default_name = f"{base_name}_{idx:02d}_p{start}-{end}.pdf"
+                    name = st.text_input(
+                        f"{idx}. p{start}-{end}",
+                        value=default_name,
+                        key=f"split_name_{idx}",
+                    )
+                    custom_names.append(normalize_pdf_name(name))
+            except ValueError as e:
+                st.error(f"입력 오류: {e}")
+
+            if st.button("범위대로 PDF 분할", key="split_pdf_button"):
+                try:
+                    if not ranges:
+                        raise ValueError("페이지 범위를 확인해주세요.")
+                    parts: List[Tuple[str, bytes]] = []
+                    for idx, (start, end) in enumerate(ranges, start=1):
+                        writer = PdfWriter()
+                        for p in range(start - 1, end):
+                            writer.add_page(reader.pages[p])
+                        part_buf = io.BytesIO()
+                        writer.write(part_buf)
+                        part_buf.seek(0)
+                        file_name = custom_names[idx - 1]
+                        parts.append((file_name, part_buf.getvalue()))
+
+                    zip_buf = io.BytesIO()
+                    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                        for file_name, payload in parts:
+                            zf.writestr(file_name, payload)
+                    zip_buf.seek(0)
+                    st.download_button(
+                        "분할 결과 ZIP 다운로드",
+                        data=zip_buf.getvalue(),
+                        file_name=f"{base_name}_split.zip",
+                        mime="application/zip",
+                        key="download_split_zip",
+                    )
+                    st.session_state["split_parts"] = parts
+                except ValueError as e:
+                    st.error(f"입력 오류: {e}")
+                except Exception as e:
+                    st.error("알 수 없는 오류가 발생했습니다.")
+                    st.exception(e)
+
+        parts = st.session_state.get("split_parts", [])
+        if parts:
+            st.subheader("분할된 PDF 미리보기")
+            for idx, (file_name, payload) in enumerate(parts, start=1):
+                with st.expander(f"{idx}. {file_name}", expanded=False):
+                    st.download_button(
+                        "이 PDF 바로 다운로드",
+                        data=payload,
+                        file_name=file_name,
+                        mime="application/pdf",
+                        key=f"download_split_{idx}",
+                    )
+                    show_pdf_preview(payload, key_prefix=f"split_preview_{idx}")
